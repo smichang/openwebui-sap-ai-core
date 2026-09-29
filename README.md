@@ -57,7 +57,7 @@ has to be hardcoded.
 ## Installation
 
 1. In OpenWebUI, go to **Admin Panel → Functions → + (New Function)**.
-2. Paste the contents of `sap-ai-core-orchestration-public.py` and save.
+2. Paste the contents of `sap-ai-core-orchestration.py` and save.
 3. Enable the function with the toggle.
 4. Open the function's **Valves** (gear icon) and paste your service key JSON
    into `AICORE_SERVICE_KEY`. Set `AICORE_RESOURCE_GROUP` if you don't use `default`.
