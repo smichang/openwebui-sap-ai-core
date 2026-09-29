@@ -4,6 +4,17 @@ An Open WebUI **Pipe** that connects chat to the models on your SAP AI Core
 **orchestration** deployment. Models are discovered automatically, so nothing
 has to be hardcoded.
 
+- **Keeps the SAP AI Core key hidden.** The service key lives only in the
+  pipe's admin-only Valves. Users chat through Open WebUI and never see or
+  handle SAP credentials.
+- **Works as an OpenAI-compatible LLM.** SAP's orchestration API is wrapped so
+  its models appear as normal Open WebUI models, streaming and tool calls
+  included. Open WebUI's OpenAI-style `/api/chat/completions` endpoint can call
+  them too.
+- **Records token usage in Open WebUI's database.** Usage is saved with each
+  chat message, and optionally logged to a PostgreSQL table for reporting
+  (see *Token logging*).
+
 ## Features
 
 - **Automatic model discovery.** Reads the deployment's `modelFilterList`, so
