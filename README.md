@@ -77,6 +77,76 @@ Environment-only settings (not valves, because the URL can contain a password):
 | `USAGE_LOG_DB_URL` | *(empty)* | PostgreSQL DSN, for example `postgresql://user:pass@host:5432/db`. Empty means log lines only. |
 | `USAGE_LOG_TABLE` | `aicore_usage_log` | Table name. Created with `CREATE TABLE IF NOT EXISTS` on the first insert. |
 
+## Choosing which models appear (`modelFilterList`)
+
+The model selector is built from the `modelFilterList` parameter on your
+orchestration deployment's configuration. To add or remove models, change that
+list in SAP AI Core, not in Open WebUI.
+
+SAP restricts orchestration models with two parameter bindings, set when the
+deployment is created:
+
+| Binding | Meaning |
+| --- | --- |
+| `modelFilterList` | JSON list of `modelName` and optional `modelVersions`. If `modelVersions` is omitted, all versions of that model are considered. |
+| `modelFilterListType` | `allow` (only these models, the default) or `deny` (everything except these). |
+
+**1. Create a configuration** with the bindings, then create an
+`orchestration` deployment from it. In **SAP AI Launchpad** use
+*ML Operations → Configurations*. Or call the API
+(`POST {AI_API_URL}/v2/lm/configurations`, with the `AI-Resource-Group` header):
+
+```json
+{
+  "name": "orchestration-models",
+  "executableId": "orchestration",
+  "scenarioId": "orchestration",
+  "versionId": "0.0.1",
+  "parameterBindings": [
+    {
+      "key": "modelFilterList",
+      "value": "[{\"modelName\": \"anthropic--claude-4.5-haiku\"}, {\"modelName\": \"anthropic--claude-4.6-sonnet\"}, {\"modelName\": \"gpt-5.6-sol\", \"modelVersions\": [\"2026-07-09\", \"latest\"]}]"
+    },
+    {
+      "key": "modelFilterListType",
+      "value": "allow"
+    }
+  ]
+}
+```
+
+The `value` of `modelFilterList` is a JSON **string**, so the inner quotes are
+escaped. The list decoded looks like this:
+
+```json
+[
+  { "modelName": "anthropic--claude-4.5-haiku" },
+  { "modelName": "anthropic--claude-4.6-sonnet" },
+  { "modelName": "gpt-5.6-luna", "modelVersions": ["2026-07-09", "latest"] },
+  { "modelName": "gpt-5.6-terra", "modelVersions": ["2026-07-09", "latest"] },
+  { "modelName": "gpt-5.6-sol", "modelVersions": ["2026-07-09", "latest"] }
+]
+```
+
+**2. Wait for the deployment to be RUNNING.** The pipe uses the RUNNING
+`orchestration` deployment in your resource group.
+
+**3. Refresh Open WebUI.** The pipe caches discovery for `MODEL_CACHE_TTL`
+seconds (default 300). Wait that long, or set it to `0` and reload the page.
+
+How the pipe reads the list:
+
+- Use the exact SAP model name, for example `anthropic--claude-4.6-sonnet`.
+- Leave `modelFilterListType` unset or `allow`. The pipe reads only
+  `modelFilterList` and treats it as the models to show, so with `deny` it
+  would list the models SAP blocks.
+- If `modelVersions` includes `latest` the model is used as `latest`. Otherwise
+  the first listed version is used. With no `modelVersions`, `latest` is used.
+- Wildcards such as `["*"]` are not expanded. List the models you want by name.
+
+If a model you added does not appear, see *No models in the selector* and
+*Model list looks outdated* under Troubleshooting.
+
 ## Token logging
 
 1. Set `ENABLE_TOKEN_LOGGING` to `true` in the Valves.
