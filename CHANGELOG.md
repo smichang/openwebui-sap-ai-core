@@ -3,6 +3,15 @@
 Version history for `sap-ai-core-orchestration.py`. The version is also
 in the file header, which OpenWebUI shows in the UI.
 
+## 1.5.0 — 2026-10-12
+
+### Added
+
+- Built-in tool `sap_ai_core_my_usage` for every user: their own token usage by
+  model and day plus quota limit, used, remaining and percent. It always uses
+  the signed-in user's email, so it can't show anyone else's usage. The admin
+  tool now also re-checks the role when it runs.
+
 ## 1.4.0 — 2026-10-12
 
 ### Added

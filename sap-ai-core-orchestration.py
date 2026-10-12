@@ -2,7 +2,7 @@
 title: SAP AI Core Orchestration
 description: Chat pipe for SAP AI Core's orchestration deployment. Auto-discovers allow-listed models, streams, supports OpenWebUI Tools, images/PDF, file uploads and Claude prompt caching.
 author: Smith Chang
-version: 1.4.0
+version: 1.5.0
 license: MIT
 requirements: aiohttp, requests, psycopg2-binary
 """
@@ -94,7 +94,9 @@ class Pipe:
         QUOTA_WARN_PERCENT: int = int(os.getenv("QUOTA_WARN_PERCENT", 80))  # 0 disables the near-limit notice
 
     REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
-    NATIVE_TOOLS = {"sap_ai_core_usage_summary"}  # pipe-native, admin-only; see pipe()'s tool loop
+    ADMIN_TOOLS = {"sap_ai_core_usage_summary"}  # pipe-native, admin-only
+    USER_TOOLS = {"sap_ai_core_my_usage"}  # pipe-native, any user, own data only
+    NATIVE_TOOLS = ADMIN_TOOLS | USER_TOOLS  # not client-side — see pipe()'s tool loop
 
     def __init__(self):
         self.name = "SAP Orch - "
@@ -920,6 +922,57 @@ class Pipe:
             "models": sorted(model_totals.values(), key=lambda model: model["total_tokens"], reverse=True),
         })
 
+    def _my_usage_tool_spec(self) -> dict:
+        """Offered to every user; scoped to the caller's own email in _run_my_usage()."""
+        return {
+            "type": "function",
+            "function": {
+                "name": "sap_ai_core_my_usage",
+                "description": (
+                    "Show the current user's own SAP AI Core token usage for a month: requests and "
+                    "tokens by model and by day (UTC), plus their monthly quota limit, usage, "
+                    "remaining and percent used. Only ever returns the caller's own data."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "month": {
+                            "type": "string",
+                            "description": "Month as YYYY-MM. Defaults to the current month.",
+                        },
+                    },
+                },
+            },
+        }
+
+    def _run_my_usage(self, month: Optional[str], user_email: str, is_admin: bool) -> str:
+        """Per-user usage; user_email comes from the request, never from model arguments."""
+        if not user_email or user_email == "unknown":
+            return json.dumps({"error": "Your email is not available, so your usage cannot be looked up."})
+        raw = self._run_usage_summary(month, user_email)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return raw
+        if "error" in data:
+            return raw
+        me = next((u for u in data.get("users", []) if u["user_email"] == user_email), None)
+        used = me["quota_used"] if me else 0
+        limit = self._quota_limit(user_email)
+        exempt = is_admin and self.valves.QUOTA_EXEMPT_ADMINS
+        data.pop("users", None)
+        data["user_email"] = user_email
+        data["quota"] = {
+            "limit": None if exempt or not limit else limit,
+            "used": used,
+            "remaining": max(limit - used, 0) if limit and not exempt else None,
+            "used_percent": round(used * 100 / limit, 1) if limit and not exempt else None,
+            "exempt": exempt,
+            "note": "used is billing-weighted (cached x0.1, cache_creation x1.25), so it differs from total_tokens. limit null means no limit applies.",
+        }
+        data["quota_note"] = data["quota"]["note"]
+        return json.dumps(data)
+
     async def _request(self, session: aiohttp.ClientSession, payload: dict, timing: dict) -> aiohttp.ClientResponse:
         t0 = time.monotonic()
         deployment_url, _ = await asyncio.to_thread(self._discover_orchestration)
@@ -1086,6 +1139,7 @@ class Pipe:
                 return
 
             tool_specs = self._tool_specs(client_tools, body)
+            tool_specs = tool_specs + [self._my_usage_tool_spec()]
             if is_admin:
                 tool_specs = tool_specs + [self._usage_summary_tool_spec()]
             stream = body.get("stream", True)
@@ -1138,7 +1192,7 @@ class Pipe:
                 if not tool_calls:
                     break
 
-                resolvable_names = set(client_tools.keys()) | (self.NATIVE_TOOLS if is_admin else set())
+                resolvable_names = set(client_tools.keys()) | self.USER_TOOLS | (self.ADMIN_TOOLS if is_admin else set())
                 unresolvable = [c for c in tool_calls if c.get("function", {}).get("name") not in resolvable_names]
                 if unresolvable:
                     # Declared via body["tools"] with no callable here — hand back to the caller.
@@ -1166,8 +1220,13 @@ class Pipe:
                         args = {}
                     tool_start = time.monotonic()
                     try:
-                        if name in self.NATIVE_TOOLS:
-                            result = await asyncio.to_thread(self._run_usage_summary, args.get("month"), args.get("user_email"))
+                        if name in self.USER_TOOLS:
+                            result = await asyncio.to_thread(self._run_my_usage, args.get("month"), user_email, is_admin)
+                        elif name in self.ADMIN_TOOLS:
+                            if not is_admin:
+                                result = json.dumps({"error": "This tool is admin-only."})
+                            else:
+                                result = await asyncio.to_thread(self._run_usage_summary, args.get("month"), args.get("user_email"))
                         else:
                             result = await self._call_client_tool(client_tools.get(name), args)
                     except Exception as tool_err:

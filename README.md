@@ -214,14 +214,20 @@ their usage and the reset date, and no request is sent to SAP AI Core.
 - Use `MONTHLY_TOKEN_QUOTA_OVERRIDES` for individual limits. Emails must match
   the user's OpenWebUI email exactly.
 
-## Usage summary tool (admins)
+## Usage tools
 
-For admin users the pipe offers a built-in tool, `sap_ai_core_usage_summary`.
-Ask the model, for example, "show token usage for 2026-10" or "who is close to
+**For every user: `sap_ai_core_my_usage`.** Users can ask "how much have I used
+this month?". It returns their own requests and tokens by model and by day, and
+their quota limit, usage, remaining and percent used. It always uses the
+signed-in user's email, so it cannot show anyone else's usage.
+
+**For admins: `sap_ai_core_usage_summary`.** Ask the model, for example, "show token usage for 2026-10" or "who is close to
 their quota". It reads the token log table and returns requests and tokens by
 user and model, a per-day breakdown (UTC), and each user's `quota_limit`,
 `quota_used`, `quota_remaining` and `quota_used_percent`. It needs
 `USAGE_LOG_DB_URL`. Only users with usage in the month are listed.
+
+Both tools need `USAGE_LOG_DB_URL`.
 
 ## Usage
 
