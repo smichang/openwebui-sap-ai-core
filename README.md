@@ -80,6 +80,10 @@ except the proxy valves (see the table).
 | `HTTP_PROXY` / `HTTPS_PROXY` | *(empty)* | Optional proxy. Environment variables are `AICORE_HTTP_PROXY` and `AICORE_HTTPS_PROXY`. |
 | `UPLOADED_FILE_MAX_CHARS` | `60000` | Per-file cap on extracted upload text. |
 | `ENABLE_TOKEN_LOGGING` | `false` | Master switch for the log line and database rows. |
+| `MONTHLY_TOKEN_QUOTA` | `0` | Per-user monthly token limit (UTC month). `0` disables. For example `100000000` is 100 million. See *Monthly token quota*. |
+| `MONTHLY_TOKEN_QUOTA_OVERRIDES` | *(empty)* | JSON object of per-user limits, for example `{"alice@example.com": 500000000}`. A limit of `0` means unlimited for that user. |
+| `QUOTA_EXEMPT_ADMINS` | `true` | Admins are not limited. |
+| `QUOTA_WARN_PERCENT` | `80` | Append a usage notice to the reply once a user passes this percentage of their limit. `0` disables the notice. |
 
 Environment-only settings (not valves, because the URL can contain a password):
 
@@ -190,6 +194,34 @@ FROM aicore_usage_log
 WHERE created_at >= EXTRACT(EPOCH FROM date_trunc('month', now()))
 GROUP BY 1, 2 ORDER BY tokens DESC;
 ```
+
+## Monthly token quota
+
+Set `MONTHLY_TOKEN_QUOTA` to limit how many tokens each user can use per
+calendar month (UTC). Before each turn the pipe adds up the user's usage for the
+month from the token log table. A user at or over the limit gets a message with
+their usage and the reset date, and no request is sent to SAP AI Core.
+
+- Units are raw tokens. Use plain digits, for example `1000000000` for 1 billion.
+- Cache tokens are weighted by billing rate: input and output count 1x, cached
+  tokens 0.1x, cache-creation tokens 1.25x. The quota usage is therefore lower
+  than the `total_tokens` column when the cache is used.
+- It needs `ENABLE_TOKEN_LOGGING` set to `true` and `USAGE_LOG_DB_URL` set, since
+  usage is read from the table. Without them, or if the database cannot be
+  reached, turns are allowed and an error is logged.
+- The check runs once per turn, so one long turn can pass the limit. Totals are
+  cached for 60 seconds per worker, so several workers can overshoot slightly.
+- Use `MONTHLY_TOKEN_QUOTA_OVERRIDES` for individual limits. Emails must match
+  the user's OpenWebUI email exactly.
+
+## Usage summary tool (admins)
+
+For admin users the pipe offers a built-in tool, `sap_ai_core_usage_summary`.
+Ask the model, for example, "show token usage for 2026-10" or "who is close to
+their quota". It reads the token log table and returns requests and tokens by
+user and model, a per-day breakdown (UTC), and each user's `quota_limit`,
+`quota_used`, `quota_remaining` and `quota_used_percent`. It needs
+`USAGE_LOG_DB_URL`. Only users with usage in the month are listed.
 
 ## Usage
 

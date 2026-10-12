@@ -3,6 +3,25 @@
 Version history for `sap-ai-core-orchestration.py`. The version is also
 in the file header, which OpenWebUI shows in the UI.
 
+## 1.4.0 — 2026-10-12
+
+### Added
+
+- Admin-only built-in tool `sap_ai_core_usage_summary`: token usage by user,
+  model and day for a month, plus each user's quota limit, usage, remaining
+  and percent used (billing-weighted).
+
+## 1.3.0 — 2026-10-12
+
+### Added
+
+- Optional per-user monthly token quota: `MONTHLY_TOKEN_QUOTA` (off by default),
+  `MONTHLY_TOKEN_QUOTA_OVERRIDES`, `QUOTA_EXEMPT_ADMINS` and `QUOTA_WARN_PERCENT`.
+  Checked before each turn against the usage table for the current UTC month,
+  with cached tokens weighted 0.1x and cache-creation tokens 1.25x. Allows the
+  turn if the table is not configured or the database cannot be reached.
+- The usage table now also gets a `(user_email, created_at)` index.
+
 ## 1.2.0 — 2026-09-29
 
 First public release.

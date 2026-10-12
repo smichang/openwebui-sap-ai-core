@@ -2,7 +2,7 @@
 title: SAP AI Core Orchestration
 description: Chat pipe for SAP AI Core's orchestration deployment. Auto-discovers allow-listed models, streams, supports OpenWebUI Tools, images/PDF, file uploads and Claude prompt caching.
 author: Smith Chang
-version: 1.2.0
+version: 1.4.0
 license: MIT
 requirements: aiohttp, requests, psycopg2-binary
 """
@@ -31,6 +31,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from pydantic import BaseModel
 import aiohttp
 import asyncio
+import datetime
 import inspect
 import json
 import logging
@@ -82,7 +83,18 @@ class Pipe:
         ENABLE_TOKEN_LOGGING: bool = os.getenv("ENABLE_TOKEN_LOGGING", "false").lower() == "true"
         # USAGE_LOG_DB_URL / USAGE_LOG_TABLE are env-only, not valves: the DSN can hold a password.
 
+        # Per-user monthly token cap in raw tokens (e.g. 100000000 = 100 million),
+        # cache tokens weighted by billing rate, checked before each turn. 0 = off.
+        # Reads the usage table, so it needs ENABLE_TOKEN_LOGGING and USAGE_LOG_DB_URL;
+        # without them, or if the database is unreachable, turns are allowed.
+        MONTHLY_TOKEN_QUOTA: int = int(os.getenv("MONTHLY_TOKEN_QUOTA", 0))
+        # JSON object {"email": limit}; a limit of 0 means unlimited for that user.
+        MONTHLY_TOKEN_QUOTA_OVERRIDES: str = os.getenv("MONTHLY_TOKEN_QUOTA_OVERRIDES", "")
+        QUOTA_EXEMPT_ADMINS: bool = os.getenv("QUOTA_EXEMPT_ADMINS", "true").lower() == "true"
+        QUOTA_WARN_PERCENT: int = int(os.getenv("QUOTA_WARN_PERCENT", 80))  # 0 disables the near-limit notice
+
     REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
+    NATIVE_TOOLS = {"sap_ai_core_usage_summary"}  # pipe-native, admin-only; see pipe()'s tool loop
 
     def __init__(self):
         self.name = "SAP Orch - "
@@ -91,6 +103,7 @@ class Pipe:
         self._usage_log_db_url = os.getenv("USAGE_LOG_DB_URL", "")
         self._usage_log_table = os.getenv("USAGE_LOG_TABLE", "aicore_usage_log")
         self._usage_table_ready = False
+        self._quota_cache: Dict[str, Tuple[str, int, float]] = {}  # email -> (month key, used, fetched at)
         self._background_tasks: set = set()  # strong refs so fire-and-forget tasks aren't garbage-collected
         self._access_token: Optional[str] = None
         self._token_expiry: float = 0.0
@@ -649,6 +662,11 @@ class Pipe:
                 sql.Identifier(f"{self._usage_log_table}_created_at_idx"), table
             )
         )
+        cur.execute(
+            sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (user_email, created_at)").format(
+                sql.Identifier(f"{self._usage_log_table}_user_created_idx"), table
+            )
+        )
         self._usage_table_ready = True
 
     def _log_usage_row(self, **fields) -> None:
@@ -680,11 +698,227 @@ class Pipe:
             if conn is not None:
                 conn.close()
 
+    QUOTA_CACHE_TTL = 60  # seconds a month-to-date total is reused per user
+    # Cache reads bill at ~0.1x and cache writes at ~1.25x, so the quota weights them.
+    QUOTA_CACHED_WEIGHT = 0.1
+    QUOTA_CACHE_CREATION_WEIGHT = 1.25
+
+    def _quota_tokens(self, input_tokens: int, output_tokens: int, cached_tokens: int, cache_creation_tokens: int) -> int:
+        return round(
+            input_tokens + output_tokens
+            + cached_tokens * self.QUOTA_CACHED_WEIGHT
+            + cache_creation_tokens * self.QUOTA_CACHE_CREATION_WEIGHT
+        )
+
+    def _quota_limit(self, user_email: str) -> int:
+        """Effective monthly limit for a user; 0 means unlimited."""
+        raw = self.valves.MONTHLY_TOKEN_QUOTA_OVERRIDES.strip()
+        if raw:
+            try:
+                overrides = json.loads(raw)
+                if isinstance(overrides, dict) and user_email in overrides:
+                    return max(int(overrides[user_email]), 0)
+            except (ValueError, TypeError):
+                self.logger.warning("MONTHLY_TOKEN_QUOTA_OVERRIDES is not a valid JSON object; ignoring")
+        return max(self.valves.MONTHLY_TOKEN_QUOTA, 0)
+
+    def _month_bounds(self) -> Tuple[str, int, int]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start = datetime.datetime(now.year, now.month, 1, tzinfo=datetime.timezone.utc)
+        end = datetime.datetime(now.year + (now.month == 12), (now.month % 12) + 1, 1, tzinfo=datetime.timezone.utc)
+        return f"{now.year:04d}-{now.month:02d}", int(start.timestamp()), int(end.timestamp())
+
+    def _month_usage(self, user_email: str) -> Optional[int]:
+        """Month-to-date weighted tokens for a user, cached briefly; None if unavailable (fail open)."""
+        if not self._usage_log_db_url or not self.valves.ENABLE_TOKEN_LOGGING:
+            return None
+        month_key, start, end = self._month_bounds()
+        cached = self._quota_cache.get(user_email)
+        if cached and cached[0] == month_key and time.time() - cached[2] < self.QUOTA_CACHE_TTL:
+            return cached[1]
+        conn = None
+        try:
+            import psycopg2
+            from psycopg2 import sql
+
+            conn = psycopg2.connect(self._usage_log_db_url, connect_timeout=5)
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL(
+                        "SELECT COALESCE(ROUND(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+                        "+ COALESCE(cached_tokens, 0) * %(cw)s + COALESCE(cache_creation_tokens, 0) * %(ccw)s)), 0) "
+                        "FROM {} WHERE user_email = %(user_email)s AND created_at >= %(start)s AND created_at < %(end)s"
+                    ).format(sql.Identifier(self._usage_log_table)),
+                    {
+                        "user_email": user_email, "start": start, "end": end,
+                        "cw": self.QUOTA_CACHED_WEIGHT, "ccw": self.QUOTA_CACHE_CREATION_WEIGHT,
+                    },
+                )
+                used = int(cur.fetchone()[0])
+        except Exception as e:
+            self.logger.error(f"quota lookup failed (allowing turn): {e}")
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+        self._quota_cache[user_email] = (month_key, used, time.time())
+        return used
+
+    def _add_quota_usage(self, user_email: str, tokens: int) -> None:
+        """Bump the cached total so the next turn sees this one before the insert lands."""
+        cached = self._quota_cache.get(user_email)
+        if cached and cached[0] == self._month_bounds()[0]:
+            self._quota_cache[user_email] = (cached[0], cached[1] + tokens, cached[2])
+
     def _log_usage_background(self, **fields) -> None:
         """Fire-and-forget so a slow database never delays the reply."""
         task = asyncio.create_task(asyncio.to_thread(self._log_usage_row, **fields))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def _usage_summary_tool_spec(self) -> dict:
+        """Offered to the model only for admin users — see pipe()'s is_admin gate."""
+        return {
+            "type": "function",
+            "function": {
+                "name": "sap_ai_core_usage_summary",
+                "description": (
+                    "Admin-only. Query the SAP AI Core token usage ledger and summarize "
+                    "requests and tokens by user and model for a given month, plus a per-day "
+                    "breakdown (overall and per user, UTC days), and each user's monthly token quota "
+                    "limit, usage, remaining and percent used."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "month": {
+                            "type": "string",
+                            "description": "Month as YYYY-MM. Defaults to the current month.",
+                        },
+                        "user_email": {
+                            "type": "string",
+                            "description": "Restrict to one user's email. Omit for all users.",
+                        },
+                    },
+                },
+            },
+        }
+
+    def _run_usage_summary(self, month: Optional[str], user_email: Optional[str]) -> str:
+        """
+        Sync (psycopg2) handler for the native usage-summary tool — run via
+        asyncio.to_thread. Returns a JSON string (error or results) since this
+        becomes a tool-role message content, not a user-facing reply directly.
+        """
+        if not self._usage_log_db_url:
+            return json.dumps({"error": "Usage logging is not configured (USAGE_LOG_DB_URL is empty)."})
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            year, mon = (int(p) for p in month.split("-", 1)) if month else (now.year, now.month)
+        except (ValueError, AttributeError):
+            return json.dumps({"error": f"Invalid month {month!r}; expected YYYY-MM."})
+        start = datetime.datetime(year, mon, 1, tzinfo=datetime.timezone.utc)
+        end = datetime.datetime(year + (mon == 12), (mon % 12) + 1, 1, tzinfo=datetime.timezone.utc)
+
+        conn = None
+        try:
+            import psycopg2
+            from psycopg2 import sql
+
+            conn = psycopg2.connect(self._usage_log_db_url, connect_timeout=5)
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL(
+                        "SELECT user_email, model_name, model_version, COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                        "SUM(cached_tokens), SUM(cache_creation_tokens), SUM(total_tokens) "
+                        "FROM {table} WHERE created_at >= %(start)s AND created_at < %(end)s {user_filter} "
+                        "GROUP BY user_email, model_name, model_version "
+                        "ORDER BY SUM(total_tokens) DESC, user_email, model_name, model_version"
+                    ).format(
+                        table=sql.Identifier(self._usage_log_table),
+                        user_filter=sql.SQL("AND user_email = %(user_email)s") if user_email else sql.SQL(""),
+                    ),
+                    {"start": int(start.timestamp()), "end": int(end.timestamp()), "user_email": user_email},
+                )
+                rows = cur.fetchall()
+                cur.execute(
+                    sql.SQL(
+                        "SELECT (to_timestamp(created_at) AT TIME ZONE 'UTC')::date, user_email, COUNT(*), "
+                        "SUM(input_tokens), SUM(output_tokens), SUM(cached_tokens), "
+                        "SUM(cache_creation_tokens), SUM(total_tokens) "
+                        "FROM {table} WHERE created_at >= %(start)s AND created_at < %(end)s {user_filter} "
+                        "GROUP BY 1, user_email ORDER BY 1, user_email"
+                    ).format(
+                        table=sql.Identifier(self._usage_log_table),
+                        user_filter=sql.SQL("AND user_email = %(user_email)s") if user_email else sql.SQL(""),
+                    ),
+                    {"start": int(start.timestamp()), "end": int(end.timestamp()), "user_email": user_email},
+                )
+                day_rows = cur.fetchall()
+        except Exception as e:
+            return json.dumps({"error": f"Usage query failed: {e}"})
+        finally:
+            if conn is not None:
+                conn.close()
+
+        user_totals: Dict[str, dict] = {}
+        model_totals: Dict[Tuple[str, str], dict] = {}
+        for row in rows:
+            user_email_value, model_name, model_version, requests_count, input_tokens, output_tokens, cached_tokens, cache_creation_tokens, total_tokens = row
+            model = {"model_name": model_name, "model_version": model_version}
+            counts = {
+                "requests": requests_count or 0,
+                "input_tokens": input_tokens or 0,
+                "output_tokens": output_tokens or 0,
+                "cached_tokens": cached_tokens or 0,
+                "cache_creation_tokens": cache_creation_tokens or 0,
+                "total_tokens": total_tokens or 0,
+            }
+
+            user = user_totals.setdefault(user_email_value, {"user_email": user_email_value, **{key: 0 for key in counts}, "models": []})
+            for key, value in counts.items():
+                user[key] += value
+            user["models"].append({**model, **counts})
+
+            model_key = (model_name, model_version)
+            model_total = model_totals.setdefault(model_key, {**model, **{key: 0 for key in counts}})
+            for key, value in counts.items():
+                model_total[key] += value
+
+        day_totals: Dict[str, dict] = {}
+        for day, day_user, requests_count, input_tokens, output_tokens, cached_tokens, cache_creation_tokens, total_tokens in day_rows:
+            counts = {
+                "requests": requests_count or 0,
+                "input_tokens": input_tokens or 0,
+                "output_tokens": output_tokens or 0,
+                "cached_tokens": cached_tokens or 0,
+                "cache_creation_tokens": cache_creation_tokens or 0,
+                "total_tokens": total_tokens or 0,
+            }
+            day_key = day.isoformat()
+            entry = day_totals.setdefault(day_key, {"date": day_key, **{key: 0 for key in counts}, "users": []})
+            for key, value in counts.items():
+                entry[key] += value
+            entry["users"].append({"user_email": day_user, **counts})
+
+        for user in user_totals.values():
+            limit = self._quota_limit(user["user_email"])
+            used = self._quota_tokens(
+                user["input_tokens"], user["output_tokens"], user["cached_tokens"], user["cache_creation_tokens"]
+            )
+            user["quota_limit"] = limit or None  # None = unlimited
+            user["quota_used"] = used
+            user["quota_remaining"] = max(limit - used, 0) if limit else None
+            user["quota_used_percent"] = round(used * 100 / limit, 1) if limit else None
+
+        return json.dumps({
+            "month": f"{year:04d}-{mon:02d}",
+            "quota_note": "quota_used is billing-weighted (cached x0.1, cache_creation x1.25), so it differs from total_tokens. Admins may be exempt (QUOTA_EXEMPT_ADMINS).",
+            "days": sorted(day_totals.values(), key=lambda day: day["date"]),
+            "users": sorted(user_totals.values(), key=lambda user: user["total_tokens"], reverse=True),
+            "models": sorted(model_totals.values(), key=lambda model: model["total_tokens"], reverse=True),
+        })
 
     async def _request(self, session: aiohttp.ClientSession, payload: dict, timing: dict) -> aiohttp.ClientResponse:
         t0 = time.monotonic()
@@ -819,10 +1053,31 @@ class Pipe:
             return
 
         client_tools = __tools__ or {}
+        is_admin = (__user__ or {}).get("role") == "admin"
         usage_totals = {
             "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
             "cached_tokens": 0, "cache_creation_tokens": 0,
         }
+
+        quota_limit = 0
+        quota_used = None
+        if not (is_admin and self.valves.QUOTA_EXEMPT_ADMINS):
+            quota_limit = self._quota_limit(user_email)
+        if quota_limit:
+            quota_used = await asyncio.to_thread(self._month_usage, user_email)
+            if quota_used is not None and quota_used >= quota_limit:
+                month_key, _, end = self._month_bounds()
+                reset = datetime.datetime.fromtimestamp(end, datetime.timezone.utc).strftime("%Y-%m-%d")
+                self.logger.info(
+                    f"quota exceeded | user={user_email} | chat={chatid} | used={quota_used} | limit={quota_limit}"
+                )
+                if __event_emitter__:
+                    await __event_emitter__({"type": "notification", "data": {"type": "warning", "content": "Monthly token quota reached."}})
+                yield (
+                    f"Monthly token quota reached: {quota_used:,} of {quota_limit:,} tokens used in {month_key} (UTC). "
+                    f"The quota resets on {reset} 00:00 UTC. Contact an administrator if you need more."
+                )
+                return
 
         try:
             model_name, model_version = await asyncio.to_thread(self._resolve_model, body.get("model", ""))
@@ -831,6 +1086,8 @@ class Pipe:
                 return
 
             tool_specs = self._tool_specs(client_tools, body)
+            if is_admin:
+                tool_specs = tool_specs + [self._usage_summary_tool_spec()]
             stream = body.get("stream", True)
             turn_messages = self._inject_uploaded_files(list(messages), body)
             self.logger.info(
@@ -881,7 +1138,8 @@ class Pipe:
                 if not tool_calls:
                     break
 
-                unresolvable = [c for c in tool_calls if c.get("function", {}).get("name") not in client_tools]
+                resolvable_names = set(client_tools.keys()) | (self.NATIVE_TOOLS if is_admin else set())
+                unresolvable = [c for c in tool_calls if c.get("function", {}).get("name") not in resolvable_names]
                 if unresolvable:
                     # Declared via body["tools"] with no callable here — hand back to the caller.
                     self.logger.info(f"Returning {len(unresolvable)} unexecutable tool call(s) to the caller.")
@@ -908,7 +1166,10 @@ class Pipe:
                         args = {}
                     tool_start = time.monotonic()
                     try:
-                        result = await self._call_client_tool(client_tools.get(name), args)
+                        if name in self.NATIVE_TOOLS:
+                            result = await asyncio.to_thread(self._run_usage_summary, args.get("month"), args.get("user_email"))
+                        else:
+                            result = await self._call_client_tool(client_tools.get(name), args)
                     except Exception as tool_err:
                         self.logger.error(f"Client tool {name} failed | user={user_email} | error={tool_err}")
                         result = f"Error: {tool_err}"
@@ -965,6 +1226,19 @@ class Pipe:
                         tool_ms=round(timing["tool_ms"]),
                         auth_ms=round(timing.get("auth_ms", 0)),
                         discovery_ms=round(timing.get("discovery_ms", 0)),
+                    )
+            if quota_limit and quota_used is not None and total_tokens:
+                turn_quota_tokens = self._quota_tokens(
+                    usage_totals["input_tokens"], usage_totals["output_tokens"],
+                    usage_totals["cached_tokens"], usage_totals["cache_creation_tokens"],
+                )
+                self._add_quota_usage(user_email, turn_quota_tokens)
+                warn_pct = self.valves.QUOTA_WARN_PERCENT
+                new_used = quota_used + turn_quota_tokens
+                if warn_pct and new_used * 100 >= quota_limit * warn_pct:
+                    yield (
+                        f"\n\n_(Token quota: {new_used:,} of {quota_limit:,} used this month "
+                        f"({min(new_used * 100 // quota_limit, 100)}%).)_"
                     )
             if stream and total_tokens:
                 # Yielded (not emitted) so OpenWebUI persists it; streaming only,
